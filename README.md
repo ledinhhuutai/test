@@ -9,9 +9,21 @@ Design and implement a backend service that maintains a real-time leaderboard an
 - Prevent malicious score increments; enforce authorization and validation (R5).
 - Documentation includes a diagram and improvement notes; hand-off for backend team.
 
+### Module Contract
+- Responsibilities: issue short-lived proofs for actions, accept verified score increments, maintain a real-time top-10 view, and expose read APIs/streams.
+- Invariants:
+  - Server is source of truth; client cannot set scores directly.
+  - Each increment is idempotent per `Idempotency-Key`.
+  - A user has at most one active action session at a time.
+  - Leaderboard reads reflect Redis state; DB is durable ledger.
+- Inputs/Outputs:
+  - Input: API calls from website or trusted producers.
+  - Output: REST responses and realtime stream events.
+- Dependencies: Redis (leaderboard+pub/sub), PostgreSQL (ledger/current totals), JWT signing keys.
+
 ### Goals
 - Secure, server-authoritative score updates with verifiable proofs.
-- Fast, consistent reads for the top leaderboard (p95 < 50ms under load).
+- Fast, consistent reads suitable for production under typical load.
 - Durable writes with recovery and replay capability.
 
 ### Non-Goals
@@ -109,7 +121,7 @@ Body:
 Behavior:
 - Validate auth; ensure no active session.
 - Create session, expiring in 5 minutes.
-- Issue action token (JWT; exp ~2 minutes) with claims: `sub`, `actionSessionId`, `actionType`, `exp`.
+- Issue action ticket (short-lived JWT; exp ~2 minutes) with claims: `sub`, `actionSessionId`, `actionType`, `exp`.
 - Cache token in Redis with TTL.
 Response:
 ```json
@@ -125,7 +137,7 @@ Body:
 ```
 Behavior:
 - Validate scope/subject; bounds check `delta` (1..100 configurable).
-- Verify `actionToken` signature and expiration; session status must be `started`.
+- Verify action ticket signature and expiration; session status must be `started`.
 - Write durable `score_events` (idempotent via `Idempotency-Key`).
 - Upsert `user_scores` (`score = score + delta`) in a transaction.
 - Mark session `completed`.
@@ -213,11 +225,43 @@ sequenceDiagram
   API-->>C: 200 {score, top10}
 ```
 
+### State Diagram
+```mermaid
+stateDiagram-v2
+  [*] --> Idle
+  Idle --> Ticketed: POST /v1/actions/start
+  Ticketed --> Completed: POST /v1/scores/increment (valid)
+  Ticketed --> Expired: TTL reached / revoke
+  Completed --> Idle: session closed
+  Expired --> Idle: new session allowed
+```
+
 ### Test Plan
 - Unit: token validation, idempotency, bounds, rate limits.
 - Integration: write → Redis updated → Pub/Sub → WS client receives.
 - Chaos: kill Redis/DB; verify behavior and recovery.
-- Load: target p95 latency < 50ms at 1k rps with Redis hot.
+- Load: measure latency and throughput under realistic conditions; ensure acceptable performance.
+
+### Acceptance Criteria
+- Top-10 endpoint returns correct ordering and values under concurrent updates.
+- Valid action ticket increments persist to DB and reflect in Redis.
+- Idempotency prevents duplicate increments for same key.
+- Unauthorized or expired tickets are rejected; no Redis-only updates.
+- Realtime stream delivers snapshot on connect and deltas thereafter.
+
+### Implementation Checklist
+- Define JWT signing keys and validation middleware for action tickets.
+- Implement `POST /v1/actions/start` with session storage and Redis caching.
+- Implement `POST /v1/scores/increment` with idempotency, DB txn, Redis ZSET update, and pub/sub.
+- Implement `GET /v1/leaderboard/top` with Redis read and DB fallback + optional enrichment.
+- Implement SSE/WS gateway subscribing to `leaderboard:updates`.
+- Add rate limiting and anomaly detection hooks.
+- Add metrics, logs, and tracing spans across API → DB/Redis.
+
+### Open Questions
+- Should multiple leaderboards exist (global vs seasonal vs regional) from day one?
+- Do we enrich entries with profile data synchronously or lazily on the client?
+- What are max delta bounds per action, and do we need daily caps?
 
 ### Improvement Notes
 - Use a dedicated keyspace per leaderboard (global/season/region) for isolation.
